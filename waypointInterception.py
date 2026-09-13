@@ -29,6 +29,7 @@ if RANDOM_SEED is not None:
 
 cycle_timer = 0.0
 cycle_duration = 10.0
+SIM_SPEED_MULTIPLIER = 1.0  # simulated seconds per real second - fast-forwards training without changing flight physics
 population_size = 100
 mutation_rate = 0.05
 mutation_strength = 0.15
@@ -44,6 +45,7 @@ NUM_WAYPOINTS = 3
 WAYPOINT_RADIUS = 30.0
 CONSTANT_SPEED = 60.0
 WAYPOINT_CLEAR_BONUS = 30000.0  # subtracted from accumulated distance when a waypoint is cleared
+EARLY_ARRIVAL_BONUS_SCALE = 1.0  # extra bonus multiplier for reaching a waypoint early in the cycle (0 = no time credit)
 
 # --- FLIGHT MODEL RATES ---
 PITCH_RATE = 50.0   # deg/sec at full pitch command
@@ -101,8 +103,41 @@ def generate_course():
 # ---------------------------------------------------------------------------
 # SPECTATOR CAMERA & HUD
 # ---------------------------------------------------------------------------
+def frame_spectator_camera():
+    """
+    Position/aim the spectator camera so the whole generated course (the
+    start balloon plus every waypoint) fits in view. Waypoint positions are
+    randomized per course, so a fixed camera offset only happened to frame
+    some layouts and clipped others - this instead frames whatever course
+    was actually generated.
+    """
+    if waypoints_t is None:
+        return
+
+    all_pts = torch.cat([torch.tensor([START_POS], dtype=torch.float32), waypoints_t], dim=0)
+    min_xyz = all_pts.min(dim=0).values
+    max_xyz = all_pts.max(dim=0).values
+    center = (min_xyz + max_xyz) / 2.0
+
+    # Widest horizontal extent of the course, with a floor so a very short/
+    # straight course doesn't leave the camera sitting awkwardly close.
+    span = max((max_xyz[0] - min_xyz[0]).item(), (max_xyz[2] - min_xyz[2]).item(), 200.0)
+
+    cam_x = center[0].item() + span * 0.9
+    cam_y = center[1].item()  # same altitude as the waypoints - horizontal view, no downward tilt
+    cam_z = min_xyz[2].item() - span * 0.6  # pull back behind the earliest point in the course
+
+    camera.position = (cam_x, cam_y, cam_z)
+    camera.look_at((center[0].item(), center[1].item(), center[2].item()))
+    camera.rotation_z = 0  # look_at can introduce roll; force level (horizontal) framing
+
+
+# Fallback framing before a course exists yet (waypoints_t is still None here).
+# frame_spectator_camera() is called again once initialize_population() has
+# generated the real course, and re-called whenever the course is randomized.
 camera.position = (START_POS[0] + 800, START_POS[1] + 250, START_POS[2] + 400)
 camera.look_at((START_POS[0], START_POS[1], START_POS[2] + 400))
+camera.rotation_z = 0
 hud_text = Text(position=(-0.85, 0.45), scale=1.5, color=color.green)
 
 # ---------------------------------------------------------------------------
@@ -377,6 +412,7 @@ auto_evolve_cb = Checkbox(label="AUTO EVOLVE", parent=menu_container, position=(
 def randomize_and_reset():
     generate_course()
     reset_batch_states()
+    frame_spectator_camera()
     timer_info_text.text = f"Cycle: {generation_count} (Course Reset)"
 
 
@@ -429,19 +465,27 @@ Button(text="[ LOAD WEIGHTS ]", parent=menu_container, position=(-0.71, 0.23, -0
 Button(text="[ SAVE WEIGHTS ]", parent=menu_container, position=(-0.71, 0.16, -0.02), scale=(0.28, 0.045),
        color=color.lime, text_color=color.black, on_click=save_weights_dialog)
 
-Text(text="Population Size:", parent=menu_container, position=(0.0, 0.44, -0.01), scale=1.4, color=color.black)
-pop_val_text = Text(text="", parent=menu_container, position=(0.15, 0.34, -0.01), scale=1.4, color=color.black)
-Button(text="-", parent=menu_container, position=(0.26, 0.33, -0.02), scale=(0.035, 0.045), color=color.red,
+Text(text="Population Size:", parent=menu_container, position=(-0.15, 0.44, -0.01), scale=1.4, color=color.black)
+pop_val_text = Text(text="", parent=menu_container, position=(0.00, 0.34, -0.01), scale=1.4, color=color.black)
+Button(text="-", parent=menu_container, position=(0.11, 0.33, -0.02), scale=(0.035, 0.045), color=color.red,
        on_click=lambda: change_pop(-10))
-Button(text="+", parent=menu_container, position=(0.30, 0.33, -0.02), scale=(0.035, 0.045), color=color.green,
+Button(text="+", parent=menu_container, position=(0.15, 0.33, -0.02), scale=(0.035, 0.045), color=color.green,
        on_click=lambda: change_pop(10))
 
-Text(text="Cycle Duration:", parent=menu_container, position=(0.38, 0.44, -0.01), scale=1.4, color=color.black)
-cycle_val_text = Text(text="", parent=menu_container, position=(0.52, 0.34, -0.01), scale=1.4, color=color.black)
-Button(text="-", parent=menu_container, position=(0.63, 0.33, -0.02), scale=(0.035, 0.045), color=color.red,
+Text(text="Cycle Duration:", parent=menu_container, position=(0.19, 0.44, -0.01), scale=1.4, color=color.black)
+cycle_val_text = Text(text="", parent=menu_container, position=(0.33, 0.34, -0.01), scale=1.4, color=color.black)
+Button(text="-", parent=menu_container, position=(0.44, 0.33, -0.02), scale=(0.035, 0.045), color=color.red,
        on_click=lambda: change_cycle_time(-1.0))
-Button(text="+", parent=menu_container, position=(0.67, 0.33, -0.02), scale=(0.035, 0.045), color=color.green,
+Button(text="+", parent=menu_container, position=(0.48, 0.33, -0.02), scale=(0.035, 0.045), color=color.green,
        on_click=lambda: change_cycle_time(1.0))
+
+Text(text="Sim Speed:", parent=menu_container, position=(0.53, 0.44, -0.01), scale=1.4, color=color.black)
+sim_speed_val_text = Text(text="", parent=menu_container, position=(0.65, 0.34, -0.01), scale=1.4, color=color.black)
+Button(text="-", parent=menu_container, position=(0.715, 0.33, -0.02), scale=(0.035, 0.045), color=color.red,
+       on_click=lambda: change_sim_speed(-1.0))
+Button(text="+", parent=menu_container, position=(0.755, 0.33, -0.02), scale=(0.035, 0.045), color=color.green,
+       on_click=lambda: change_sim_speed(1.0))
+
 
 # --- SPECTATOR CONTROLS DIAGRAM ---
 # Image lives at textures/spectator_controls.png, next to this script - Ursina's
@@ -454,6 +498,7 @@ controls_image = Entity(parent=menu_container, model='quad', texture='spectator_
 def update_param_labels():
     pop_val_text.text = str(population_size)
     cycle_val_text.text = f"{cycle_duration:.1f}s"
+    sim_speed_val_text.text = f"{SIM_SPEED_MULTIPLIER:.1f}x"
 
 
 def change_pop(delta):
@@ -465,6 +510,12 @@ def change_pop(delta):
 def change_cycle_time(delta):
     global cycle_duration
     cycle_duration = max(2.0, min(30.0, cycle_duration + delta))
+    update_param_labels()
+
+
+def change_sim_speed(delta):
+    global SIM_SPEED_MULTIPLIER
+    SIM_SPEED_MULTIPLIER = max(1.0, min(20.0, SIM_SPEED_MULTIPLIER + delta))
     update_param_labels()
 
 
@@ -615,6 +666,7 @@ def input(key):
 # ---------------------------------------------------------------------------
 initialize_population(population_size)
 setup_visual_bots()
+frame_spectator_camera()
 update_param_labels()
 show_menu()
 
@@ -655,7 +707,8 @@ def update():
 
     if menu_container.enabled: return
 
-    cycle_timer += dt
+    sim_dt = dt * SIM_SPEED_MULTIPLIER
+    cycle_timer += sim_dt
 
     # Neural Network Observations - Trigonometric Guidance Inputs (7 Dimensions)
     # Vectorized across the whole population instead of looping bot-by-bot.
@@ -706,9 +759,9 @@ def update():
         pitch_cmd = actions[:, 0]
         roll_cmd = actions[:, 1]
 
-        bot_rot[:, 0] += pitch_cmd * PITCH_RATE * dt
-        bot_rot[:, 2] += roll_cmd * ROLL_RATE * dt
-        bot_rot[:, 1] += bot_rot[:, 2] * YAW_COUPLING * dt
+        bot_rot[:, 0] += pitch_cmd * PITCH_RATE * sim_dt
+        bot_rot[:, 2] += roll_cmd * ROLL_RATE * sim_dt
+        bot_rot[:, 1] += bot_rot[:, 2] * YAW_COUPLING * sim_dt
 
         b_yaw = torch.deg2rad(bot_rot[:, 1])
         b_pitch = torch.deg2rad(bot_rot[:, 0])
@@ -718,13 +771,13 @@ def update():
             torch.cos(b_yaw) * torch.cos(b_pitch),
         ], dim=1)
 
-        bot_pos += fwd_vec * CONSTANT_SPEED * dt
+        bot_pos += fwd_vec * CONSTANT_SPEED * sim_dt
         bot_pos[:, 1].clamp_(min=0.0)
 
         active_waypoint_pos = waypoints_t[bot_target_idx]
         dist = torch.norm(bot_pos - active_waypoint_pos, dim=1)
 
-        bot_accumulated_dist += dist * dt
+        bot_accumulated_dist += dist * sim_dt
         bot_min_dist = torch.minimum(bot_min_dist, dist)
 
         reached = dist < WAYPOINT_RADIUS
@@ -732,13 +785,19 @@ def update():
         advancing = reached & has_next_waypoint
         finishing = reached & ~has_next_waypoint & (bot_cleared_count < NUM_WAYPOINTS)
 
+        # Reaching a waypoint early in the cycle earns a bigger bonus than
+        # reaching it right before time runs out (1x base bonus at the very
+        # end of the cycle, up to (1 + EARLY_ARRIVAL_BONUS_SCALE)x at t=0).
+        time_credit_frac = max(0.0, 1.0 - (cycle_timer / cycle_duration))
+        waypoint_bonus = WAYPOINT_CLEAR_BONUS * (1.0 + EARLY_ARRIVAL_BONUS_SCALE * time_credit_frac)
+
         bot_target_idx[advancing] += 1
         bot_cleared_count[advancing] += 1
-        bot_accumulated_dist[advancing] -= WAYPOINT_CLEAR_BONUS
+        bot_accumulated_dist[advancing] -= waypoint_bonus
         bot_min_dist[advancing] = float('inf')
 
         bot_cleared_count[finishing] += 1
-        bot_accumulated_dist[finishing] -= WAYPOINT_CLEAR_BONUS
+        bot_accumulated_dist[finishing] -= waypoint_bonus
         bot_min_dist[finishing] = 0.0
 
     # Per-bot history logging stays a Python loop (cheap list append, not math),
