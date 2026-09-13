@@ -8,6 +8,7 @@ from ursina import *
 import random
 import math
 import time
+import copy
 import tkinter as tk
 from tkinter import filedialog
 import json
@@ -19,6 +20,12 @@ app = Ursina()
 # ---------------------------------------------------------------------------
 game_paused = True
 auto_evolve = False
+
+# Set to an int for reproducible runs, or None for a fresh random run each launch.
+RANDOM_SEED = 42
+if RANDOM_SEED is not None:
+    random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
 
 cycle_timer = 0.0
 cycle_duration = 10.0
@@ -36,6 +43,12 @@ START_POS = (0.0, 200.0, 0.0)
 NUM_WAYPOINTS = 3
 WAYPOINT_RADIUS = 30.0
 CONSTANT_SPEED = 60.0
+WAYPOINT_CLEAR_BONUS = 30000.0  # subtracted from accumulated distance when a waypoint is cleared
+
+# --- FLIGHT MODEL RATES ---
+PITCH_RATE = 50.0   # deg/sec at full pitch command
+ROLL_RATE = 50.0    # deg/sec at full roll command
+YAW_COUPLING = 0.8  # how strongly roll induces yaw
 
 waypoints_t = None
 waypoint_entities = []
@@ -123,6 +136,38 @@ class PolicyNet(nn.Module):
             pointer += num_el
 
 
+class BatchedPolicyNet:
+    """
+    Runs every genome's forward pass in a single vectorized batch instead of
+    looping over the population and calling set_weights_flat() + forward()
+    once per bot. This is the same math as PolicyNet, just executed as one
+    batched matmul per layer (shape (P, out, in) @ (P, in, 1)) rather than
+    population_size sequential single-genome forward passes.
+
+    Only valid for a PolicyNet whose trunk is Linear/Tanh/Linear/Tanh/Linear/Tanh,
+    since it hardcodes 3 linear layers pulled from named_parameters() order.
+    """
+
+    def __init__(self, reference_net):
+        self.param_shapes = [p.shape for p in reference_net.parameters()]
+        self.param_sizes = [p.numel() for p in reference_net.parameters()]
+
+    def forward(self, batch_weights, obs):
+        # batch_weights: (P, total_params), obs: (P, obs_dim)
+        w0, b0, w2, b2, w4, b4 = torch.split(batch_weights, self.param_sizes, dim=1)
+        P = batch_weights.shape[0]
+
+        w0 = w0.view(P, *self.param_shapes[0])
+        w2 = w2.view(P, *self.param_shapes[2])
+        w4 = w4.view(P, *self.param_shapes[4])
+
+        x = obs.unsqueeze(-1)  # (P, obs_dim, 1)
+        x = torch.tanh(torch.bmm(w0, x).squeeze(-1) + b0)
+        x = torch.tanh(torch.bmm(w2, x.unsqueeze(-1)).squeeze(-1) + b2)
+        x = torch.tanh(torch.bmm(w4, x.unsqueeze(-1)).squeeze(-1) + b4)
+        return x  # (P, act_dim)
+
+
 class Genome:
     def __init__(self, weights, bot_id, age=0):
         self.weights = weights
@@ -149,6 +194,7 @@ bot_accumulated_dist = None
 
 visual_bots = []
 shared_net = PolicyNet()
+batched_net = BatchedPolicyNet(shared_net)
 
 
 def initialize_population(size):
@@ -261,7 +307,11 @@ def finish_cycle():
     if 0 not in chosen_indices:
         chosen_indices[0] = 0
 
-    surviving_parents = [population[idx] for idx in chosen_indices]
+    # chosen_indices may repeat (weighted sampling with replacement) - deep-copy
+    # each survivor so duplicate slots never share one Genome/weights-tensor
+    # instance (that aliasing previously meant "different" bots could secretly
+    # mutate/report state for each other).
+    surviving_parents = [copy.deepcopy(population[idx]) for idx in chosen_indices]
 
     new_population = []
 
@@ -393,6 +443,13 @@ Button(text="-", parent=menu_container, position=(0.63, 0.33, -0.02), scale=(0.0
 Button(text="+", parent=menu_container, position=(0.67, 0.33, -0.02), scale=(0.035, 0.045), color=color.green,
        on_click=lambda: change_cycle_time(1.0))
 
+# --- SPECTATOR CONTROLS DIAGRAM ---
+# Image lives at textures/spectator_controls.png, next to this script - Ursina's
+# default asset search picks up images placed in a "textures" folder that sits
+# alongside the entry-point .py file, so it's referenced here by name only.
+controls_image = Entity(parent=menu_container, model='quad', texture='spectator_controls',
+                        scale=(0.42, 0.56), position=(0.71, 0.01, -0.02))
+
 
 def update_param_labels():
     pop_val_text.text = str(population_size)
@@ -488,12 +545,12 @@ def build_bot_board():
 
 
 # --- MULTI-GENERATION METRICS GRAPH ---
-graph_bg = Entity(parent=menu_container, model='quad', color=color.rgba(15, 22, 32, 230), scale=(0.82, 0.45),
-                  position=(0.42, -0.12, -0.01))
+graph_bg = Entity(parent=menu_container, model='quad', color=color.rgba(15, 22, 32, 230), scale=(0.87, 0.48),
+                  position=(0.03, -0.12, -0.01))
 graph_line_min = Entity(parent=graph_bg, position=(-0.42, -0.38, -0.02))
 graph_line_max = Entity(parent=graph_bg, position=(-0.42, -0.38, -0.02))
 graph_line_mean = Entity(parent=graph_bg, position=(-0.42, -0.38, -0.02))
-Text(text="Fitness Spread Across Cycles (Lower is Better)", parent=graph_bg, position=(-0.45, 0.44, -0.02), scale=2,
+Text(text="Fitness Spread Across Cycles\n(Lower is Better)", parent=graph_bg, position=(-0.45, 0.44, -0.02), scale=2,
      color=color.black)
 Text(text="Min (Lime) | Mean (Yellow) | Max (Red)", parent=graph_bg, position=(-0.45, -0.44, -0.02), scale=1.5,
      color=color.black)
@@ -601,89 +658,95 @@ def update():
     cycle_timer += dt
 
     # Neural Network Observations - Trigonometric Guidance Inputs (7 Dimensions)
-    obs_list = []
-    for i in range(population_size):
-        # Current bot forward vector (velocity heading)
-        b_yaw, b_pitch = math.radians(bot_rot[i, 1].item()), math.radians(bot_rot[i, 0].item())
-        fx = math.sin(b_yaw) * math.cos(b_pitch)
-        fy = -math.sin(b_pitch)
-        fz = math.cos(b_yaw) * math.cos(b_pitch)
-        fwd_vec = torch.tensor([fx, fy, fz])
+    # Vectorized across the whole population instead of looping bot-by-bot.
+    with torch.no_grad():
+        b_yaw = torch.deg2rad(bot_rot[:, 1])
+        b_pitch = torch.deg2rad(bot_rot[:, 0])
+        fwd_vec = torch.stack([
+            torch.sin(b_yaw) * torch.cos(b_pitch),
+            -torch.sin(b_pitch),
+            torch.cos(b_yaw) * torch.cos(b_pitch),
+        ], dim=1)  # (P, 3)
 
-        t_pos = waypoints_t[bot_target_idx[i]]
-        rel = t_pos - bot_pos[i]
-        dist_to_target = rel.norm().item()
-        target_dir = rel / (dist_to_target + 1e-6)
+        t_pos = waypoints_t[bot_target_idx]  # (P, 3)
+        rel = t_pos - bot_pos
+        dist_to_target = rel.norm(dim=1)  # (P,)
+        target_dir = rel / (dist_to_target.unsqueeze(1) + 1e-6)
 
         # 1. Trigonometric alignment cosine (-1 to 1)
-        alignment_cos = torch.dot(fwd_vec, target_dir).item()
+        alignment_cos = (fwd_vec * target_dir).sum(dim=1)
 
-        # 2. Horizontal azimuth angle error
-        heading_to_target = math.degrees(math.atan2(rel[0].item(), rel[2].item()))
-        azimuth_diff = (heading_to_target - bot_rot[i, 1].item() + 180) % 360 - 180
+        # 2. Horizontal azimuth angle error, wrapped to (-180, 180]
+        heading_to_target = torch.rad2deg(torch.atan2(rel[:, 0], rel[:, 2]))
+        azimuth_diff = (heading_to_target - bot_rot[:, 1] + 180) % 360 - 180
 
-        # 3. Vertical elevation angle error
-        horiz_dist = math.sqrt(rel[0].item() ** 2 + rel[2].item() ** 2)
-        target_pitch = math.degrees(math.atan2(-rel[1].item(), horiz_dist))
-        elevation_diff = (target_pitch - bot_rot[i, 0].item() + 180) % 360 - 180
+        # 3. Vertical elevation angle error, wrapped to (-90, 90] so it can't
+        #    exceed the [-1, 1] input range once divided by 90 below (the
+        #    original mod-360 wrap allowed up to +/-180 here).
+        horiz_dist = torch.sqrt(rel[:, 0] ** 2 + rel[:, 2] ** 2)
+        target_pitch = torch.rad2deg(torch.atan2(-rel[:, 1], horiz_dist))
+        elevation_diff = (target_pitch - bot_rot[:, 0] + 90) % 180 - 90
 
-        obs = torch.tensor([
-            alignment_cos,  # 3D heading alignment (cos angle)
-            azimuth_diff / 180.0,  # Horizontal steering error
-            elevation_diff / 90.0,  # Vertical steering error
-            min(1.0, dist_to_target / 1000.0),  # Normalized distance
-            bot_rot[i, 0].item() / 90.0,  # Current pitch
-            bot_rot[i, 2].item() / 90.0,  # Current roll
-            bot_pos[i, 1].item() / 500.0  # Current altitude
-        ], dtype=torch.float32)
-        obs_list.append(obs)
+        batch_obs = torch.stack([
+            alignment_cos,                                  # 3D heading alignment (cos angle)
+            azimuth_diff / 180.0,                            # Horizontal steering error
+            elevation_diff / 90.0,                            # Vertical steering error
+            torch.clamp(dist_to_target / 1000.0, max=1.0),   # Normalized distance
+            bot_rot[:, 0] / 90.0,                             # Current pitch
+            bot_rot[:, 2] / 90.0,                             # Current roll
+            bot_pos[:, 1] / 500.0,                            # Current altitude
+        ], dim=1).float()  # (P, 7)
 
-    batch_obs = torch.stack(obs_list)
-    actions = []
+        # One batched forward pass for the whole population instead of
+        # population_size individual set_weights_flat() + forward() calls.
+        batch_weights = torch.stack([g.weights for g in population])
+        actions = batched_net.forward(batch_weights, batch_obs)  # (P, 2)
 
-    for i in range(population_size):
-        shared_net.set_weights_flat(population[i].weights)
-        with torch.no_grad():
-            act = shared_net(batch_obs[i])
-            actions.append(act)
+        # Vectorized physics update (constant speed, pitch & roll from actions)
+        pitch_cmd = actions[:, 0]
+        roll_cmd = actions[:, 1]
 
-    actions = torch.stack(actions)
+        bot_rot[:, 0] += pitch_cmd * PITCH_RATE * dt
+        bot_rot[:, 2] += roll_cmd * ROLL_RATE * dt
+        bot_rot[:, 1] += bot_rot[:, 2] * YAW_COUPLING * dt
 
-    # Batched Physics Update (Constant Speed, Only Pitch & Roll from Actions)
-    for i in range(population_size):
-        pitch_cmd, roll_cmd = actions[i][0].item(), actions[i][1].item()
+        b_yaw = torch.deg2rad(bot_rot[:, 1])
+        b_pitch = torch.deg2rad(bot_rot[:, 0])
+        fwd_vec = torch.stack([
+            torch.sin(b_yaw) * torch.cos(b_pitch),
+            -torch.sin(b_pitch),
+            torch.cos(b_yaw) * torch.cos(b_pitch),
+        ], dim=1)
 
-        bot_rot[i, 0] += pitch_cmd * 50.0 * dt
-        bot_rot[i, 2] += roll_cmd * 50.0 * dt
-        bot_rot[i, 1] += bot_rot[i, 2] * 0.8 * dt
+        bot_pos += fwd_vec * CONSTANT_SPEED * dt
+        bot_pos[:, 1].clamp_(min=0.0)
 
-        b_yaw, b_pitch = math.radians(bot_rot[i, 1].item()), math.radians(bot_rot[i, 0].item())
-        fx = math.sin(b_yaw) * math.cos(b_pitch)
-        fy = -math.sin(b_pitch)
-        fz = math.cos(b_yaw) * math.cos(b_pitch)
+        active_waypoint_pos = waypoints_t[bot_target_idx]
+        dist = torch.norm(bot_pos - active_waypoint_pos, dim=1)
 
-        bot_pos[i] += torch.tensor([fx, fy, fz]) * CONSTANT_SPEED * dt
-        if bot_pos[i, 1] < 0: bot_pos[i, 1] = 0
+        bot_accumulated_dist += dist * dt
+        bot_min_dist = torch.minimum(bot_min_dist, dist)
 
-        active_waypoint_pos = waypoints_t[bot_target_idx[i]]
-        dist = torch.dist(bot_pos[i], active_waypoint_pos)
+        reached = dist < WAYPOINT_RADIUS
+        has_next_waypoint = bot_target_idx < NUM_WAYPOINTS - 1
+        advancing = reached & has_next_waypoint
+        finishing = reached & ~has_next_waypoint & (bot_cleared_count < NUM_WAYPOINTS)
 
-        bot_accumulated_dist[i] += dist.item() * dt
-        bot_min_dist[i] = min(bot_min_dist[i].item(), dist.item())
+        bot_target_idx[advancing] += 1
+        bot_cleared_count[advancing] += 1
+        bot_accumulated_dist[advancing] -= WAYPOINT_CLEAR_BONUS
+        bot_min_dist[advancing] = float('inf')
 
-        if dist < WAYPOINT_RADIUS:
-            if bot_target_idx[i] < NUM_WAYPOINTS - 1:
-                bot_target_idx[i] += 1
-                bot_cleared_count[i] += 1
-                bot_accumulated_dist[i] -= 30000.0
-                bot_min_dist[i] = float('inf')
-            elif bot_cleared_count[i] < NUM_WAYPOINTS:
-                bot_cleared_count[i] += 1
-                bot_accumulated_dist[i] -= 30000.0
-                bot_min_dist[i] = 0.0
+        bot_cleared_count[finishing] += 1
+        bot_accumulated_dist[finishing] -= WAYPOINT_CLEAR_BONUS
+        bot_min_dist[finishing] = 0.0
 
-        if int(cycle_timer * 10) > len(population[i].history):
-            population[i].history.append(bot_accumulated_dist[i].item())
+    # Per-bot history logging stays a Python loop (cheap list append, not math),
+    # needed for the per-bot tooltip graphs in the UI.
+    if int(cycle_timer * 10) > len(population[0].history if population else []):
+        accum_list = bot_accumulated_dist.tolist()
+        for i in range(population_size):
+            population[i].history.append(accum_list[i])
 
     for i in range(min(10, population_size)):
         visual_bots[i].position = (bot_pos[i][0].item(), bot_pos[i][1].item(), bot_pos[i][2].item())
