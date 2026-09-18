@@ -42,15 +42,15 @@ global_next_id = 1
 # --- SPATIAL & WAYPOINT GLOBALS ---
 START_POS = (0.0, 200.0, 0.0)
 NUM_WAYPOINTS = 3
-WAYPOINT_RADIUS = 30.0
+WAYPOINT_RADIUS = 20.0
 CONSTANT_SPEED = 60.0
 WAYPOINT_CLEAR_BONUS = 30000.0  # subtracted from accumulated distance when a waypoint is cleared
-EARLY_ARRIVAL_BONUS_SCALE = 1.0  # extra bonus multiplier for reaching a waypoint early in the cycle (0 = no time credit)
+EARLY_ARRIVAL_BONUS_SCALE = 0.0  # extra bonus multiplier for reaching a waypoint early in the cycle (0 = no time credit)
 
 # --- FLIGHT MODEL RATES ---
 PITCH_RATE = 50.0   # deg/sec at full pitch command
 ROLL_RATE = 50.0    # deg/sec at full roll command
-YAW_COUPLING = 0.8  # how strongly roll induces yaw
+YAW_COUPLING = 1.4  # how strongly roll induces yaw
 
 waypoints_t = None
 waypoint_entities = []
@@ -92,10 +92,18 @@ def generate_course():
         current_base = pt
 
         ring_color = color.hsv(waypoint_hues[i % len(waypoint_hues)], 0.9, 0.9)
-        ent = Entity(model='sphere', color=ring_color, scale=WAYPOINT_RADIUS * 2, unlit=True, position=(t_x, t_y, t_z))
-        Text(parent=ent, text=f"{i + 1}", scale=5, position=(0, 0.6, 0), color=color.white, billboard=True,
+
+        # Small solid marker so the waypoint reads as a point, not a room-sized orb.
+        marker = Entity(model='sphere', color=ring_color, scale=20, unlit=True, position=(t_x, t_y, t_z))
+        Text(parent=marker, text=f"{i + 1}", scale=5, position=(0, 0.6, 0), color=color.white, billboard=True,
              origin=(0, 0))
-        waypoint_entities.append(ent)
+        waypoint_entities.append(marker)
+
+        # Faint wireframe outline at the actual capture radius, so you can see
+        # how close a bot needs to get without the marker itself being huge.
+        capture_outline = Entity(model='sphere', color=ring_color, scale=WAYPOINT_RADIUS * 2, unlit=True,
+                                  wireframe=True, alpha=0.35, position=(t_x, t_y, t_z))
+        waypoint_entities.append(capture_outline)
 
     waypoints_t = torch.stack(pts)
 
@@ -601,7 +609,7 @@ graph_bg = Entity(parent=menu_container, model='quad', color=color.rgba(15, 22, 
 graph_line_min = Entity(parent=graph_bg, position=(-0.42, -0.38, -0.02))
 graph_line_max = Entity(parent=graph_bg, position=(-0.42, -0.38, -0.02))
 graph_line_mean = Entity(parent=graph_bg, position=(-0.42, -0.38, -0.02))
-Text(text="Fitness Spread Across Cycles\n(Lower is Better)", parent=graph_bg, position=(-0.45, 0.44, -0.02), scale=2,
+Text(text="Fitness Spread Across Cycles\n(Lower is Better)", parent=graph_bg, position=(-0.45, 0.48, -0.02), scale=2,
      color=color.black)
 Text(text="Min (Lime) | Mean (Yellow) | Max (Red)", parent=graph_bg, position=(-0.45, -0.44, -0.02), scale=1.5,
      color=color.black)
@@ -761,6 +769,7 @@ def update():
 
         bot_rot[:, 0] += pitch_cmd * PITCH_RATE * sim_dt
         bot_rot[:, 2] += roll_cmd * ROLL_RATE * sim_dt
+        bot_rot[:, 2].clamp_(-90.0, 90.0)  # matches the +/-90 range "current roll" is normalized against as an input
         bot_rot[:, 1] += bot_rot[:, 2] * YAW_COUPLING * sim_dt
 
         b_yaw = torch.deg2rad(bot_rot[:, 1])
@@ -777,7 +786,11 @@ def update():
         active_waypoint_pos = waypoints_t[bot_target_idx]
         dist = torch.norm(bot_pos - active_waypoint_pos, dim=1)
 
-        bot_accumulated_dist += dist * sim_dt
+        # Bots that already finished the course before this frame stop
+        # accumulating distance entirely - their fitness is locked in at the
+        # moment they finish, not penalized for whatever they do afterward.
+        still_racing = bot_cleared_count < NUM_WAYPOINTS
+        bot_accumulated_dist[still_racing] += dist[still_racing] * sim_dt
         bot_min_dist = torch.minimum(bot_min_dist, dist)
 
         reached = dist < WAYPOINT_RADIUS
@@ -808,6 +821,12 @@ def update():
             population[i].history.append(accum_list[i])
 
     for i in range(min(10, population_size)):
+        if bot_cleared_count[i] >= NUM_WAYPOINTS:
+            # Finished the whole course - vanish it instead of continuing to
+            # render it flying (or idling) past the last waypoint.
+            visual_bots[i].visible = False
+            continue
+        visual_bots[i].visible = True
         visual_bots[i].position = (bot_pos[i][0].item(), bot_pos[i][1].item(), bot_pos[i][2].item())
         visual_bots[i].rotation = (bot_rot[i][0].item(), bot_rot[i][1].item(), bot_rot[i][2].item())
         visual_bots[i].color = population[i].color
