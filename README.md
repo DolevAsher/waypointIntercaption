@@ -46,7 +46,7 @@ Linear(24 → 2) + Tanh
 
 ## 🎥 Demonstration
 
-[▶️ Watch the Waypoint Interception demonstration on YouTube](https://youtu.be/VK219JQ1Etk)
+[▶️ Watch the Waypoint Interception demonstration on YouTube](https://youtu.be/ZZO6a6ROt7A)
 
 
 
