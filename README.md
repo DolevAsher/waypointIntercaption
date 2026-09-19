@@ -18,7 +18,7 @@ And outputs the next flying orders:
 
 The form of the NN:
 
-![PolicyNet architecture](nn_diagram.svg)
+![PolicyNet architecture](assets/nn_diagram.svg)
 
 7 inputs → Linear(7→24) + Tanh → Linear(24→24) + Tanh → Linear(24→2) + Tanh → 2 outputs
 
