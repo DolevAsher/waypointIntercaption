@@ -1,27 +1,49 @@
-This is a Genetic Algorithm project!
+## > WAYPOINT_INTERCEPTION
 
-This project uses a genetic algorithm to teach pilot bots how to intercept waypoints.
-In a flight simulator environment we initialize one-hundred bots.
-Each bot is represented by a set of weights over a fully connected feed forward neural network.
-The FFN gets the next inputs:
-1. Alignment cosine (angle between heading and target direction)
-2. Azimuth error (horizontal steering error)
-3. Elevation error (vertical steering error)
+This is a **Genetic Algorithm project** that teaches pilot bots how to
+intercept waypoints in a flight-simulator environment.
+
+### 🧬 Genetic Algorithm
+
+We initialize **100 pilot bots**. Each bot is represented by a set of
+weights for a fully connected feed-forward neural network.
+
+The neural network receives the following inputs:
+
+1. Alignment cosine — angle between the heading and target direction
+2. Azimuth error — horizontal steering error
+3. Elevation error — vertical steering error
 4. Distance to target waypoint
 5. Current pitch
 6. Current roll
 7. Current altitude
 
-And outputs the next flying orders:
+The network produces the next flight commands:
+
 1. Pitch
 2. Roll
 
-The form of the NN:
+### 🧠 Policy Network
 
 ![PolicyNet architecture](assets/nn_diagram.svg)
 
-7 inputs → Linear(7→24) + Tanh → Linear(24→24) + Tanh → Linear(24→2) + Tanh → 2 outputs
+```text
+7 Inputs
+   │
+   ▼
+Linear(7 → 24) + Tanh
+   │
+   ▼
+Linear(24 → 24) + Tanh
+   │
+   ▼
+Linear(24 → 2) + Tanh
+   │
+   ▼
+2 Outputs
+(Pitch, Roll)
 
-We run the simulation and choose the best bots out of the candidates.
-Then we multiply the best and make minor changes to create the **evolution effect**.
-After a few dosens of generations there is a visible improvement.
+## 🎥 Demonstration
+
+[▶️ Watch the waypointInterception demonstration](https://github.com/DolevAsher/DolevAsher/blob/main/assets/demonstration.mp4)
+
