@@ -42,8 +42,7 @@ Linear(24 → 2) + Tanh
    ▼
 2 Outputs
 (Pitch, Roll)
+```
 
 ## 🎥 Demonstration
-
-[▶️ Watch the waypointInterception demonstration](https://github.com/DolevAsher/DolevAsher/blob/main/assets/demonstration.mp4)
 
